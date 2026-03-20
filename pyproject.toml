@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aeries-sis-sdk-python"
+version = "0.1.0"
+description = "A schema-first Python SDK for the Aeries SIS API."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI Codex" },
+]
+keywords = ["aeries", "sis", "sdk", "api", "education"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  "httpx>=0.27,<1.0",
+  "pydantic>=2.8,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "beautifulsoup4>=4.12,<5.0",
+  "build>=1.2,<2.0",
+  "hatchling>=1.27,<2.0",
+  "interrogate>=1.7,<2.0",
+  "mkdocs>=1.6,<2.0",
+  "mkdocs-material>=9.5,<10.0",
+  "mkdocstrings[python]>=0.26,<1.0",
+  "pytest>=8.3,<9.0",
+  "pytest-asyncio>=0.25,<1.0",
+  "pytest-cov>=6.0,<7.0",
+  "respx>=0.22,<1.0",
+  "ruff>=0.8,<1.0",
+  "mypy>=1.13,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/aeries-sis-sdk-python"
+Documentation = "https://example.github.io/aeries-sis-sdk-python/"
+Repository = "https://github.com/example/aeries-sis-sdk-python"
+Issues = "https://github.com/example/aeries-sis-sdk-python/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aeries_sis_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/contracts",
+  "/tests",
+  "/docs",
+  "/tools",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/SECURITY.md",
+  "/IMPLEMENTATION_PLAN.md",
+  "/mkdocs.yml",
+  "/Makefile",
+  "/.env.example",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config --cov=aeries_sis_sdk --cov-report=term-missing --cov-report=xml --cov-fail-under=95"
+testpaths = ["tests"]
+markers = [
+  "contract: Tests for the committed Aeries contract corpus.",
+  "integration: Tests that exercise the generated SDK end-to-end through a mock transport.",
+  "live: Tests that call a live Aeries tenant when credentials are provided.",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["aeries_sis_sdk"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 95
+skip_covered = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "tools"]
+extend-exclude = ["contracts/raw", "site", "src/aeries_sis_sdk/generated"]
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "UP",
+  "B",
+  "C4",
+  "SIM",
+  "ARG",
+  "RUF",
+]
+ignore = ["ARG001"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/aeries_sis_sdk/generated/*.py" = ["E501", "I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aeries_sis_sdk"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+strict = true
+packages = ["aeries_sis_sdk"]
+mypy_path = ["src"]
+exclude = ["^src/aeries_sis_sdk/generated/.*\\.py$"]
+
+[tool.interrogate]
+fail-under = 100
+ignore-init-method = false
+ignore-init-module = false
+ignore-magic = false
+ignore-module = false
+ignore-nested-functions = false
+ignore-private = false
+exclude = ["tests", "docs", "site", "build", "dist"]
+verbose = 1

@@ -1,0 +1,9 @@
+{
+  "pre_enrollment.get_pre_enroll_student": {
+    "side_effect": true
+  },
+  "pre_enrollment.get_pre_enroll_inactive_student": {
+    "side_effect": true
+  }
+}
+

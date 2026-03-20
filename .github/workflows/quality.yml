@@ -1,0 +1,43 @@
+name: quality
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install dependencies
+        run: ./.venv/bin/python -m pip install -e '.[dev]'
+
+      - name: Lint
+        run: make lint
+
+      - name: Type check
+        run: make typecheck
+
+      - name: Test
+        run: make test
+
+      - name: Docstring coverage
+        run: ./.venv/bin/python -m interrogate src
+
+      - name: Build docs
+        run: make docs
+
+      - name: Build package
+        run: make build
+

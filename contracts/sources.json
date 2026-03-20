@@ -1,0 +1,58 @@
+[
+  {
+    "key": "full_documentation",
+    "category": "index",
+    "url": "https://support.aeries.com/support/solutions/articles/14000077926-aeries-api-full-documentation"
+  },
+  {
+    "key": "building_request",
+    "category": "meta",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113681-aeries-api-building-a-request"
+  },
+  {
+    "key": "school_endpoints",
+    "category": "schools",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113682-aeries-api-school-related-end-points"
+  },
+  {
+    "key": "pre_enroll_students",
+    "category": "pre_enrollment",
+    "url": "https://support.aeries.com/support/solutions/articles/14000120862-aeries-api-pre-enroll-students"
+  },
+  {
+    "key": "student_endpoints",
+    "category": "students",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113683-aeries-api-student-related-end-points"
+  },
+  {
+    "key": "student_grades_endpoints",
+    "category": "grades",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113685-aeries-api-student-grades-related-end-points"
+  },
+  {
+    "key": "attendance_endpoints",
+    "category": "attendance",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113684-aeries-api-attendance-and-enrollment-related-end-points"
+  },
+  {
+    "key": "staff_endpoints",
+    "category": "staff",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113687-aeries-api-staff-related-end-points"
+  },
+  {
+    "key": "scheduling_endpoints",
+    "category": "scheduling",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113686-aeries-api-scheduling-related-end-points"
+  },
+  {
+    "key": "gradebook_endpoints",
+    "category": "gradebook",
+    "url": "https://support.aeries.com/support/solutions/articles/14000113688-gradebook-related-end-points"
+  },
+  {
+    "key": "alerts_endpoints",
+    "category": "alerts",
+    "url": "https://support.aeries.com/support/solutions/articles/14000129264-alerts"
+  }
+]
+

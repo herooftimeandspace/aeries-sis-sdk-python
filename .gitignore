@@ -1,0 +1,14 @@
+.coverage
+.coverage.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+htmlcov/
+site/
+src/aeries_sis_sdk/generated/_inventory.py
+__pycache__/
+*.pyc
+
