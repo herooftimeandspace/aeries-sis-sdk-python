@@ -14,7 +14,7 @@ class ErrorContext:
     """Carry a small amount of safe context about a failed HTTP request."""
 
     method: str
-    url: str
+    path: str
     status_code: int | None = None
     detail: str | None = None
 
@@ -41,10 +41,13 @@ class AeriesValidationError(AeriesError):
     """Raised when the API rejects the request or the response shape is invalid."""
 
 
+class AeriesResponseTooLargeError(AeriesError):
+    """Raised when a response crosses the client's configured byte limit."""
+
+
 class AeriesHTTPError(AeriesError):
     """Raised for non-auth HTTP errors returned by the API."""
 
 
 class AeriesTransportError(AeriesError):
     """Raised for local networking issues before a response is received."""
-

@@ -8,7 +8,14 @@ from typing import Any
 
 import httpx
 
-from ._runtime import RuntimeState, validate_response, wrap_transport_error
+from ._runtime import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    RuntimeState,
+    read_limited_response_async,
+    safe_request_path,
+    validate_response,
+    wrap_transport_error,
+)
 from .generated import ASYNC_NAMESPACE_REGISTRY
 
 
@@ -27,10 +34,16 @@ class AsyncClient:
         default_database_year: str | int | None = None,
         timeout: float = 30.0,
         user_agent: str = "aeries-sis-sdk-python/0.1.0",
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
         session: httpx.AsyncClient | None = None,
     ) -> None:
-        """Create an async client and attach all generated namespaces."""
+        """Create an async client and attach all generated namespaces.
+
+        ``max_response_bytes`` has the same positive-integer validation and
+        decoded-body semantics as the synchronous client so applications can
+        switch execution styles without changing their safety policy.
+        """
 
         self._state = RuntimeState(
             base_url=base_url,
@@ -38,6 +51,7 @@ class AsyncClient:
             default_database_year=default_database_year,
             timeout=timeout,
             user_agent=user_agent,
+            max_response_bytes=max_response_bytes,
         )
         self._owns_session = session is None
         self._session = session or httpx.AsyncClient(
@@ -147,26 +161,38 @@ class AsyncClient:
             operation=operation,
         )
         merged_headers = self._state.headers(headers)
+        context_path = safe_request_path(operation, final_path)
         max_attempts = 3 if self._state.should_retry(operation) else 1
         for attempt in range(1, max_attempts + 1):
             try:
-                response = await self._session.request(
+                async with self._session.stream(
                     request_method,
                     final_path,
                     params=final_params,
                     json=json,
                     headers=merged_headers,
                     timeout=timeout or self._state.timeout,
-                )
+                ) as response:
+                    if attempt < max_attempts and self._state.should_retry(
+                        operation, response.status_code
+                    ):
+                        await asyncio.sleep(0.2 * attempt)
+                        continue
+                    body = await read_limited_response_async(
+                        response,
+                        path=context_path,
+                        max_response_bytes=self._state.max_response_bytes,
+                    )
+                    return validate_response(
+                        state=self._state,
+                        operation=operation,
+                        response=response,
+                        body=body,
+                        path=context_path,
+                    )
             except httpx.HTTPError as exc:
                 if attempt < max_attempts and self._state.should_retry(operation):
                     await asyncio.sleep(0.2 * attempt)
                     continue
-                raise wrap_transport_error(request_method, final_path, exc) from exc
-            if response.status_code < 400:
-                return validate_response(state=self._state, operation=operation, response=response)
-            if attempt < max_attempts and self._state.should_retry(operation, response.status_code):
-                await asyncio.sleep(0.2 * attempt)
-                continue
-            return validate_response(state=self._state, operation=operation, response=response)
+                raise wrap_transport_error(request_method, context_path, exc) from exc
         raise RuntimeError("Unreachable retry loop exit in async client.")

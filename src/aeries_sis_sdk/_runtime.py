@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -21,6 +23,7 @@ from .errors import (
     AeriesAuthError,
     AeriesHTTPError,
     AeriesNotFoundError,
+    AeriesResponseTooLargeError,
     AeriesTransportError,
     AeriesValidationError,
     ErrorContext,
@@ -29,6 +32,9 @@ from .generated.models import MODEL_REGISTRY
 from .models import parse_payload
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_ERROR_DETAIL_CHARACTERS = 512
+LONG_ENCODED_VALUE_PATTERN = re.compile(r"[A-Za-z0-9+/=_-]{128,}")
 
 
 def build_client_base_url(base_url: str) -> str:
@@ -42,21 +48,77 @@ def build_client_base_url(base_url: str) -> str:
     return f"{normalized}/api/v5"
 
 
-def parse_error_response(response: httpx.Response) -> Exception:
-    """Turn an HTTP response into the most specific SDK exception we can."""
+def validate_max_response_bytes(value: int) -> int:
+    """Return a valid response limit or reject unsafe constructor input.
+
+    A boolean is rejected explicitly because Python treats booleans as integers,
+    while a value such as ``True`` is not a meaningful byte budget for callers.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("max_response_bytes must be a positive integer.")
+    if value <= 0:
+        raise ValueError("max_response_bytes must be a positive integer.")
+    return value
+
+
+def safe_request_path(
+    operation: ContractOperation | None,
+    fallback_path: str,
+) -> str:
+    """Choose a query-free contract path for exception context.
+
+    Generated operations use the documented template so identifiers substituted
+    into the live URL do not become part of routinely logged exception metadata.
+    Low-level requests retain only the caller-provided path without its query.
+    """
+
+    if operation is not None:
+        return operation.path_template
+    return fallback_path.split("?", maxsplit=1)[0]
+
+
+def sanitize_provider_detail(detail: str, *, secrets: tuple[str, ...] = ()) -> str | None:
+    """Return bounded provider text only when it is safe diagnostic context.
+
+    Control characters are folded into spaces. Messages containing a known
+    credential, a URL, a query string, or a long encoded value are discarded in
+    full because trying to redact unknown provider data could leave reusable or
+    student-specific information behind.
+    """
+
+    normalized = " ".join(detail.split())
+    if not normalized:
+        return None
+    if any(secret and secret in normalized for secret in secrets):
+        return None
+    lowered = normalized.casefold()
+    if "://" in lowered or "?" in normalized or LONG_ENCODED_VALUE_PATTERN.search(normalized):
+        return None
+    return normalized[:MAX_ERROR_DETAIL_CHARACTERS]
+
+
+def parse_error_response(
+    response: httpx.Response,
+    *,
+    body: bytes | None = None,
+    path: str | None = None,
+    certificate: str = "",
+) -> Exception:
+    """Turn a bounded HTTP response into the most specific safe SDK exception."""
 
     detail: str | None = None
     try:
-        payload = response.json()
-    except ValueError:
+        payload = json.loads(response.content if body is None else body)
+    except (UnicodeDecodeError, ValueError):
         payload = None
     if isinstance(payload, dict):
         detail_value = payload.get("Message")
         if isinstance(detail_value, str):
-            detail = detail_value
+            detail = sanitize_provider_detail(detail_value, secrets=(certificate,))
     context = ErrorContext(
         method=response.request.method,
-        url=str(response.request.url),
+        path=path or response.request.url.path,
         status_code=response.status_code,
         detail=detail,
     )
@@ -85,6 +147,7 @@ class RuntimeState:
         default_database_year: str | int | None,
         timeout: float,
         user_agent: str,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         """Store connection settings and the packaged contract snapshot."""
 
@@ -93,6 +156,7 @@ class RuntimeState:
         self.default_database_year = default_database_year
         self.timeout = timeout
         self.user_agent = user_agent
+        self.max_response_bytes = validate_max_response_bytes(max_response_bytes)
         self.contract = load_contract()
 
     def operation_for_request(
@@ -174,19 +238,26 @@ def validate_response(
     state: RuntimeState,
     operation: ContractOperation | None,
     response: httpx.Response,
+    body: bytes | None = None,
+    path: str | None = None,
 ) -> Any:
-    """Validate a response and return parsed JSON or raise an SDK exception."""
+    """Validate a bounded response and return parsed JSON or raise an SDK exception."""
 
     if response.status_code >= 400:
-        raise parse_error_response(response)
+        raise parse_error_response(
+            response,
+            body=body,
+            path=path,
+            certificate=state.certificate,
+        )
     if response.status_code == 204:
         return None
     try:
-        payload = response.json()
-    except ValueError as exc:
+        payload = json.loads(response.content if body is None else body)
+    except (UnicodeDecodeError, ValueError) as exc:
         context = ErrorContext(
             method=response.request.method,
-            url=str(response.request.url),
+            path=path or response.request.url.path,
             status_code=response.status_code,
             detail="Response body was not valid JSON.",
         )
@@ -194,8 +265,78 @@ def validate_response(
     return state.parse_operation_payload(operation, payload)
 
 
-def wrap_transport_error(method: str, url: str, error: Exception) -> AeriesTransportError:
-    """Convert an httpx transport error into the SDK transport exception type."""
+def response_too_large_error(
+    *,
+    response: httpx.Response,
+    path: str,
+    max_response_bytes: int,
+) -> AeriesResponseTooLargeError:
+    """Build a typed size failure that does not retain any response bytes."""
 
-    context = ErrorContext(method=method, url=url, detail=str(error))
+    context = ErrorContext(
+        method=response.request.method,
+        path=path,
+        status_code=response.status_code,
+        detail=f"Response exceeded the {max_response_bytes}-byte limit.",
+    )
+    return AeriesResponseTooLargeError(
+        f"Aeries API response exceeded the {max_response_bytes}-byte limit.",
+        context=context,
+    )
+
+
+def read_limited_response(
+    response: httpx.Response,
+    *,
+    path: str,
+    max_response_bytes: int,
+) -> bytes:
+    """Read at most the configured limit plus one decoded response byte.
+
+    Reading one extra byte distinguishes an allowed body exactly at the limit
+    from an oversized body. The temporary buffer is cleared before raising so
+    the exception cannot accidentally retain photo or provider-error bytes.
+    """
+
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        remaining = max_response_bytes + 1 - len(body)
+        body.extend(chunk[:remaining])
+        if len(body) > max_response_bytes:
+            body.clear()
+            raise response_too_large_error(
+                response=response,
+                path=path,
+                max_response_bytes=max_response_bytes,
+            )
+    return bytes(body)
+
+
+async def read_limited_response_async(
+    response: httpx.Response,
+    *,
+    path: str,
+    max_response_bytes: int,
+) -> bytes:
+    """Asynchronously read a response with the same limit-plus-one policy."""
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        remaining = max_response_bytes + 1 - len(body)
+        body.extend(chunk[:remaining])
+        if len(body) > max_response_bytes:
+            body.clear()
+            raise response_too_large_error(
+                response=response,
+                path=path,
+                max_response_bytes=max_response_bytes,
+            )
+    return bytes(body)
+
+
+def wrap_transport_error(method: str, path: str, error: Exception) -> AeriesTransportError:
+    """Convert an httpx transport error into a credential-safe SDK exception."""
+
+    del error
+    context = ErrorContext(method=method, path=path)
     return AeriesTransportError("Unable to reach the Aeries API.", context=context)

@@ -26,6 +26,7 @@ from aeries_sis_sdk import Client
 client = Client(
     base_url="https://district.example.edu/aeries",
     certificate="replace-me",
+    max_response_bytes=16 * 1024 * 1024,
 )
 
 schools = client.schools.list_schools()
@@ -39,6 +40,16 @@ print(schools)
 - `default_database_year`: Optional database year added to requests when supported.
 - `timeout`: Request timeout in seconds. Default is `30.0`.
 - `user_agent`: Optional user agent override.
+- `max_response_bytes`: Positive integer limit for each decoded response body. The
+  default is 16 MiB (`16777216` bytes). A response exactly at the limit is
+  accepted; a larger success or error response raises
+  `AeriesResponseTooLargeError` before JSON parsing. This client-level bound is
+  especially important for student-picture responses containing base64 data.
+
+Both clients read response bodies incrementally. Exceptions include only a
+query-free contract path and bounded, sanitized provider detail, so callers can
+log normal SDK errors without exposing the API certificate, query parameters,
+raw picture bytes, or a complete provider response body.
 
 Environment variables used by docs, tests, and live checks:
 
