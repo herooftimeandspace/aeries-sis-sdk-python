@@ -20,13 +20,20 @@ integer when constructing either client.
 
 The limit applies to successful and unsuccessful responses. A response already
 known to be oversized is not retried, even for an otherwise retry-safe generated
-operation. The temporary partial body is cleared before the size exception is
-created, and the exception stores only the method, status, contract path, and
-configured limit.
+operation. Retryable responses are read through the same bound and their stream
+is closed before backoff begins, so sleeping requests do not hold connections.
+The runtime asks httpx for bounded decoded chunks and clears both the temporary
+buffer and live chunk reference before creating the size exception. The
+exception stores only the method, status, contract path, and configured limit.
 
 Normal HTTP and JSON errors follow the same safe-context policy. Generated
 operations record their contract path template rather than a URL containing
 student identifiers or query parameters. Low-level requests record only the
-query-free path. Provider `Message` text is collapsed to one line and limited to
-512 characters; messages containing known credentials, URLs, query strings, or
-long encoded values are discarded in favor of generic status text.
+query-free path. For compatibility, `ErrorContext.url` continues to exist but
+contains that same safe path; `ErrorContext.path` is an equivalent alias.
+Provider `Message` text is collapsed to one line and limited to 512 characters.
+Messages containing actual request query/header values, known credentials,
+URLs, query strings, or long encoded values are discarded in favor of generic
+status text. Sanitized transport and malformed-JSON errors are raised without
+the original exception chain because httpx requests and JSON parser errors can
+retain complete credentials or response documents.

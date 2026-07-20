@@ -34,6 +34,7 @@ from .models import parse_payload
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ERROR_DETAIL_CHARACTERS = 512
+MAX_RESPONSE_CHUNK_BYTES = 64 * 1024
 LONG_ENCODED_VALUE_PATTERN = re.compile(r"[A-Za-z0-9+/=_-]{128,}")
 
 
@@ -98,6 +99,21 @@ def sanitize_provider_detail(detail: str, *, secrets: tuple[str, ...] = ()) -> s
     return normalized[:MAX_ERROR_DETAIL_CHARACTERS]
 
 
+def request_values_to_redact(request: httpx.Request) -> tuple[str, ...]:
+    """Collect actual request values that provider diagnostics must not echo.
+
+    Query parameters and headers may contain per-call credentials that differ
+    from constructor settings. Treat every non-empty value as sensitive rather
+    than trying to infer which custom names a caller considers confidential.
+    """
+
+    # Use the fully built request because caller overrides may replace the
+    # constructor certificate or add sensitive custom query/header values.
+    values = [value for _, value in request.url.params.multi_items() if value]
+    values.extend(value for value in request.headers.values() if value)
+    return tuple(dict.fromkeys(values))
+
+
 def parse_error_response(
     response: httpx.Response,
     *,
@@ -115,7 +131,11 @@ def parse_error_response(
     if isinstance(payload, dict):
         detail_value = payload.get("Message")
         if isinstance(detail_value, str):
-            detail = sanitize_provider_detail(detail_value, secrets=(certificate,))
+            request_secrets = request_values_to_redact(response.request)
+            detail = sanitize_provider_detail(
+                detail_value,
+                secrets=(*request_secrets, certificate),
+            )
     context = ErrorContext(
         method=response.request.method,
         path=path or response.request.url.path,
@@ -252,16 +272,21 @@ def validate_response(
         )
     if response.status_code == 204:
         return None
+    invalid_json = False
     try:
         payload = json.loads(response.content if body is None else body)
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError):
+        invalid_json = True
+    if invalid_json:
         context = ErrorContext(
             method=response.request.method,
             path=path or response.request.url.path,
             status_code=response.status_code,
             detail="Response body was not valid JSON.",
         )
-        raise AeriesValidationError("Aeries API returned invalid JSON.", context=context) from exc
+        # Raise after leaving the parser exception handler so JSONDecodeError
+        # cannot retain its full response document through exception chaining.
+        raise AeriesValidationError("Aeries API returned invalid JSON.", context=context)
     return state.parse_operation_payload(operation, payload)
 
 
@@ -299,11 +324,15 @@ def read_limited_response(
     """
 
     body = bytearray()
-    for chunk in response.iter_bytes():
+    chunk_size = min(MAX_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
+    # Asking httpx for bounded decoded chunks prevents a custom transport from
+    # handing this loop an arbitrarily large object before the limit is checked.
+    for chunk in response.iter_bytes(chunk_size=chunk_size):
         remaining = max_response_bytes + 1 - len(body)
         body.extend(chunk[:remaining])
         if len(body) > max_response_bytes:
             body.clear()
+            chunk = b""
             raise response_too_large_error(
                 response=response,
                 path=path,
@@ -321,11 +350,14 @@ async def read_limited_response_async(
     """Asynchronously read a response with the same limit-plus-one policy."""
 
     body = bytearray()
-    async for chunk in response.aiter_bytes():
+    chunk_size = min(MAX_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
+    # Keep async allocation behavior identical to the synchronous reader.
+    async for chunk in response.aiter_bytes(chunk_size=chunk_size):
         remaining = max_response_bytes + 1 - len(body)
         body.extend(chunk[:remaining])
         if len(body) > max_response_bytes:
             body.clear()
+            chunk = b""
             raise response_too_large_error(
                 response=response,
                 path=path,

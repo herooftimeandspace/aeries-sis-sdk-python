@@ -9,3 +9,8 @@
   bounded provider messages that are safe to retain.
 - Move the development test stack to patched pytest 9 and pytest-asyncio 1
   releases so the release audit does not retain a known pytest vulnerability.
+- Close review-discovered retention and retry gaps by bounding httpx chunks,
+  checking response size before retries, releasing streams before backoff,
+  detaching unsafe exception causes, and sanitizing actual request values.
+- Preserve `ErrorContext.url` compatibility while exposing the same query-free
+  value through the preferred `ErrorContext.path` alias.

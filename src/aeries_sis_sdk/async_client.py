@@ -164,6 +164,8 @@ class AsyncClient:
         context_path = safe_request_path(operation, final_path)
         max_attempts = 3 if self._state.should_retry(operation) else 1
         for attempt in range(1, max_attempts + 1):
+            retry_transport = False
+            transport_error = None
             try:
                 async with self._session.stream(
                     request_method,
@@ -173,26 +175,35 @@ class AsyncClient:
                     headers=merged_headers,
                     timeout=timeout or self._state.timeout,
                 ) as response:
-                    if attempt < max_attempts and self._state.should_retry(
-                        operation, response.status_code
-                    ):
-                        await asyncio.sleep(0.2 * attempt)
-                        continue
+                    # Read every status through the bound before deciding to
+                    # retry, then leave the context so backoff holds no socket.
                     body = await read_limited_response_async(
                         response,
                         path=context_path,
                         max_response_bytes=self._state.max_response_bytes,
                     )
-                    return validate_response(
-                        state=self._state,
-                        operation=operation,
-                        response=response,
-                        body=body,
-                        path=context_path,
-                    )
             except httpx.HTTPError as exc:
                 if attempt < max_attempts and self._state.should_retry(operation):
-                    await asyncio.sleep(0.2 * attempt)
-                    continue
-                raise wrap_transport_error(request_method, context_path, exc) from exc
+                    retry_transport = True
+                else:
+                    transport_error = wrap_transport_error(request_method, context_path, exc)
+            if transport_error is not None:
+                # Raise outside the active httpx handler to avoid retaining the
+                # original request through Python's exception-chain metadata.
+                raise transport_error
+            if retry_transport:
+                await asyncio.sleep(0.2 * attempt)
+                continue
+            if attempt < max_attempts and self._state.should_retry(
+                operation, response.status_code
+            ):
+                await asyncio.sleep(0.2 * attempt)
+                continue
+            return validate_response(
+                state=self._state,
+                operation=operation,
+                response=response,
+                body=body,
+                path=context_path,
+            )
         raise RuntimeError("Unreachable retry loop exit in async client.")

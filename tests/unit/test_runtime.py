@@ -19,6 +19,7 @@ from aeries_sis_sdk.errors import (
     AeriesNotFoundError,
     AeriesTransportError,
     AeriesValidationError,
+    ErrorContext,
 )
 from aeries_sis_sdk.models import AeriesModel, parse_payload
 
@@ -74,6 +75,15 @@ def test_parse_error_response_uses_message_payload() -> None:
     error = parse_error_response(response)
     assert isinstance(error, AeriesNotFoundError)
     assert "Invalid Staff ID" in str(error)
+
+
+def test_error_context_preserves_url_compatibility_with_safe_path_alias() -> None:
+    """Existing `url` construction and access should remain compatible and query-free."""
+
+    context = ErrorContext(method="GET", url="/api/v5/staff/{StaffID}")
+
+    assert context.url == "/api/v5/staff/{StaffID}"
+    assert context.path == context.url
 
 
 def test_client_retries_safe_get_requests() -> None:
