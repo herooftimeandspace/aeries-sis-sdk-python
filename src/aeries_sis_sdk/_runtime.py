@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 
@@ -99,7 +100,11 @@ def sanitize_provider_detail(detail: str, *, secrets: tuple[str, ...] = ()) -> s
     return normalized[:MAX_ERROR_DETAIL_CHARACTERS]
 
 
-def request_values_to_redact(request: httpx.Request) -> tuple[str, ...]:
+def request_values_to_redact(
+    request: httpx.Request,
+    *,
+    safe_path: str | None = None,
+) -> tuple[str, ...]:
     """Collect actual request values that provider diagnostics must not echo.
 
     Query parameters and headers may contain per-call credentials that differ
@@ -111,6 +116,18 @@ def request_values_to_redact(request: httpx.Request) -> tuple[str, ...]:
     # constructor certificate or add sensitive custom query/header values.
     values = [value for _, value in request.url.params.multi_items() if value]
     values.extend(value for value in request.headers.values() if value)
+    if safe_path:
+        template_segments = safe_path.strip("/").split("/")
+        actual_segments = unquote(request.url.path).strip("/").split("/")
+        # Base URLs may add leading tenant segments. Align the documented path
+        # from the right before collecting values substituted for placeholders.
+        if len(actual_segments) >= len(template_segments):
+            actual_segments = actual_segments[-len(template_segments) :]
+            values.extend(
+                actual
+                for template, actual in zip(template_segments, actual_segments, strict=True)
+                if "{" in template and "}" in template and actual
+            )
     return tuple(dict.fromkeys(values))
 
 
@@ -131,7 +148,7 @@ def parse_error_response(
     if isinstance(payload, dict):
         detail_value = payload.get("Message")
         if isinstance(detail_value, str):
-            request_secrets = request_values_to_redact(response.request)
+            request_secrets = request_values_to_redact(response.request, safe_path=path)
             detail = sanitize_provider_detail(
                 detail_value,
                 secrets=(*request_secrets, certificate),
@@ -189,13 +206,17 @@ class RuntimeState:
         return maybe_match_operation(self.contract, method, path)
 
     def headers(self, extra_headers: Mapping[str, str] | None = None) -> dict[str, str]:
-        """Build request headers with the project-standard JSON defaults."""
+        """Build JSON headers and require identity response encoding."""
 
-        return build_headers(
+        headers = build_headers(
             certificate=self.certificate,
             user_agent=self.user_agent,
             extra_headers=extra_headers,
         )
+        # Counting raw identity bytes prevents httpx from expanding compressed
+        # content before the SDK can enforce the response limit.
+        headers["Accept-Encoding"] = "identity"
+        return headers
 
     def request_parts(
         self,
@@ -264,12 +285,20 @@ def validate_response(
     """Validate a bounded response and return parsed JSON or raise an SDK exception."""
 
     if response.status_code >= 400:
-        raise parse_error_response(
+        error = parse_error_response(
             response,
             body=body,
             path=path,
             certificate=state.certificate,
         )
+        # Drop request, response, and body objects before this frame enters the
+        # traceback retained by the sanitized SDK exception.
+        response = None  # type: ignore[assignment]
+        body = None
+        state = None  # type: ignore[assignment]
+        operation = None
+        path = None
+        raise error
     if response.status_code == 204:
         return None
     invalid_json = False
@@ -286,26 +315,53 @@ def validate_response(
         )
         # Raise after leaving the parser exception handler so JSONDecodeError
         # cannot retain its full response document through exception chaining.
-        raise AeriesValidationError("Aeries API returned invalid JSON.", context=context)
+        error = AeriesValidationError("Aeries API returned invalid JSON.", context=context)
+        response = None  # type: ignore[assignment]
+        body = None
+        state = None  # type: ignore[assignment]
+        operation = None
+        path = None
+        raise error
     return state.parse_operation_payload(operation, payload)
 
 
 def response_too_large_error(
     *,
-    response: httpx.Response,
+    method: str,
+    status_code: int,
     path: str,
     max_response_bytes: int,
 ) -> AeriesResponseTooLargeError:
-    """Build a typed size failure that does not retain any response bytes."""
+    """Build a typed size failure entirely from safe scalar metadata."""
 
     context = ErrorContext(
-        method=response.request.method,
+        method=method,
         path=path,
-        status_code=response.status_code,
+        status_code=status_code,
         detail=f"Response exceeded the {max_response_bytes}-byte limit.",
     )
     return AeriesResponseTooLargeError(
         f"Aeries API response exceeded the {max_response_bytes}-byte limit.",
+        context=context,
+    )
+
+
+def unsupported_content_encoding_error(
+    *,
+    method: str,
+    status_code: int,
+    path: str,
+) -> AeriesValidationError:
+    """Build a safe failure for a server that ignored identity encoding."""
+
+    context = ErrorContext(
+        method=method,
+        path=path,
+        status_code=status_code,
+        detail="Compressed response bodies are not accepted.",
+    )
+    return AeriesValidationError(
+        "Aeries API returned an unsupported compressed response.",
         context=context,
     )
 
@@ -323,21 +379,46 @@ def read_limited_response(
     the exception cannot accidentally retain photo or provider-error bytes.
     """
 
+    method = response.request.method
+    status_code = response.status_code
+    content_encoding = response.headers.get("Content-Encoding", "identity").strip().casefold()
+    if content_encoding not in {"", "identity"}:
+        encoding_error = unsupported_content_encoding_error(
+            method=method,
+            status_code=status_code,
+            path=path,
+        )
+        response = None  # type: ignore[assignment]
+        raise encoding_error
+
     body = bytearray()
     chunk_size = min(MAX_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
-    # Asking httpx for bounded decoded chunks prevents a custom transport from
-    # handing this loop an arbitrarily large object before the limit is checked.
-    for chunk in response.iter_bytes(chunk_size=chunk_size):
+    if response.is_stream_consumed:
+        raw_iterator: Iterator[bytes] | None = iter((response.content,))
+    else:
+        # Identity encoding lets the SDK count transport bytes directly without
+        # httpx materializing decoded data before the limit check.
+        raw_iterator = response.iter_raw(chunk_size=chunk_size)
+    response = None  # type: ignore[assignment]
+    while raw_iterator is not None:
+        try:
+            chunk = next(raw_iterator)
+        except StopIteration:
+            raw_iterator = None
+            break
         remaining = max_response_bytes + 1 - len(body)
         body.extend(chunk[:remaining])
         if len(body) > max_response_bytes:
-            body.clear()
-            chunk = b""
-            raise response_too_large_error(
-                response=response,
+            size_error = response_too_large_error(
+                method=method,
+                status_code=status_code,
                 path=path,
                 max_response_bytes=max_response_bytes,
             )
+            body.clear()
+            chunk = b""
+            raw_iterator = None
+            raise size_error
     return bytes(body)
 
 
@@ -349,20 +430,54 @@ async def read_limited_response_async(
 ) -> bytes:
     """Asynchronously read a response with the same limit-plus-one policy."""
 
+    method = response.request.method
+    status_code = response.status_code
+    content_encoding = response.headers.get("Content-Encoding", "identity").strip().casefold()
+    if content_encoding not in {"", "identity"}:
+        encoding_error = unsupported_content_encoding_error(
+            method=method,
+            status_code=status_code,
+            path=path,
+        )
+        response = None  # type: ignore[assignment]
+        raise encoding_error
+
     body = bytearray()
     chunk_size = min(MAX_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
-    # Keep async allocation behavior identical to the synchronous reader.
-    async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+    loaded_content = b""
+    if response.is_stream_consumed:
+        loaded_content = response.content
+
+        async def loaded_iterator() -> AsyncIterator[bytes]:
+            """Yield one already-loaded body for custom test transports."""
+
+            yield loaded_content
+
+        raw_iterator: AsyncIterator[bytes] | None = loaded_iterator()
+    else:
+        # Mirror the sync path by counting raw identity bytes before parsing.
+        raw_iterator = response.aiter_raw(chunk_size=chunk_size)
+    response = None  # type: ignore[assignment]
+    while raw_iterator is not None:
+        try:
+            chunk = await anext(raw_iterator)
+        except StopAsyncIteration:
+            raw_iterator = None
+            break
         remaining = max_response_bytes + 1 - len(body)
         body.extend(chunk[:remaining])
         if len(body) > max_response_bytes:
-            body.clear()
-            chunk = b""
-            raise response_too_large_error(
-                response=response,
+            size_error = response_too_large_error(
+                method=method,
+                status_code=status_code,
                 path=path,
                 max_response_bytes=max_response_bytes,
             )
+            body.clear()
+            chunk = b""
+            loaded_content = b""
+            raw_iterator = None
+            raise size_error
     return bytes(body)
 
 

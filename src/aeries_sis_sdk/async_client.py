@@ -152,58 +152,97 @@ class AsyncClient:
     ) -> Any:
         """Send a request with contract-aware retry behavior."""
 
-        request_method, final_path, final_params = self._state.request_parts(
-            method=method,
-            path=path,
-            path_params=path_params,
-            params=params,
-            database_year=database_year,
-            operation=operation,
-        )
-        merged_headers = self._state.headers(headers)
-        context_path = safe_request_path(operation, final_path)
-        max_attempts = 3 if self._state.should_retry(operation) else 1
-        for attempt in range(1, max_attempts + 1):
-            retry_transport = False
-            transport_error = None
-            try:
-                async with self._session.stream(
-                    request_method,
-                    final_path,
-                    params=final_params,
-                    json=json,
-                    headers=merged_headers,
-                    timeout=timeout or self._state.timeout,
-                ) as response:
-                    # Read every status through the bound before deciding to
-                    # retry, then leave the context so backoff holds no socket.
-                    body = await read_limited_response_async(
-                        response,
-                        path=context_path,
-                        max_response_bytes=self._state.max_response_bytes,
-                    )
-            except httpx.HTTPError as exc:
-                if attempt < max_attempts and self._state.should_retry(operation):
-                    retry_transport = True
-                else:
-                    transport_error = wrap_transport_error(request_method, context_path, exc)
-            if transport_error is not None:
-                # Raise outside the active httpx handler to avoid retaining the
-                # original request through Python's exception-chain metadata.
-                raise transport_error
-            if retry_transport:
-                await asyncio.sleep(0.2 * attempt)
-                continue
-            if attempt < max_attempts and self._state.should_retry(
-                operation, response.status_code
-            ):
-                await asyncio.sleep(0.2 * attempt)
-                continue
-            return validate_response(
-                state=self._state,
+        request_method = ""
+        final_path = ""
+        final_params: dict[str, Any] = {}
+        merged_headers: dict[str, str] = {}
+        context_path = ""
+        body = b""
+        response: httpx.Response | None = None
+        current_response: httpx.Response | None = None
+        transport_error = None
+        try:
+            request_method, final_path, final_params = self._state.request_parts(
+                method=method,
+                path=path,
+                path_params=path_params,
+                params=params,
+                database_year=database_year,
                 operation=operation,
-                response=response,
-                body=body,
-                path=context_path,
             )
-        raise RuntimeError("Unreachable retry loop exit in async client.")
+            merged_headers = self._state.headers(headers)
+            context_path = safe_request_path(operation, final_path)
+            max_attempts = 3 if self._state.should_retry(operation) else 1
+            for attempt in range(1, max_attempts + 1):
+                retry_transport = False
+                transport_error = None
+                try:
+                    async with self._session.stream(
+                        request_method,
+                        final_path,
+                        params=final_params,
+                        json=json,
+                        headers=merged_headers,
+                        timeout=timeout or self._state.timeout,
+                    ) as current_response:
+                        response = current_response
+                        # Read every status through the bound before deciding to
+                        # retry, then leave the context so backoff holds no socket.
+                        body = await read_limited_response_async(
+                            current_response,
+                            path=context_path,
+                            max_response_bytes=self._state.max_response_bytes,
+                        )
+                except httpx.HTTPError as exc:
+                    if attempt < max_attempts and self._state.should_retry(operation):
+                        retry_transport = True
+                    else:
+                        transport_error = wrap_transport_error(
+                            request_method,
+                            context_path,
+                            exc,
+                        )
+                if transport_error is not None:
+                    # Raise outside the active httpx handler; the outer finally
+                    # clears every request-bearing local before propagation.
+                    raise transport_error
+                if retry_transport:
+                    await asyncio.sleep(0.2 * attempt)
+                    continue
+                if response is None:
+                    raise RuntimeError("A response was not available after a successful send.")
+                if attempt < max_attempts and self._state.should_retry(
+                    operation, response.status_code
+                ):
+                    await asyncio.sleep(0.2 * attempt)
+                    continue
+                return validate_response(
+                    state=self._state,
+                    operation=operation,
+                    response=response,
+                    body=body,
+                    path=context_path,
+                )
+            raise RuntimeError("Unreachable retry loop exit in async client.")
+        finally:
+            # Match sync cleanup so traceback locals expose no caller, client,
+            # request, response, body, session, or credential-bearing objects.
+            method = ""
+            path = ""
+            operation = None
+            path_params = None
+            params = None
+            json = None
+            headers = None
+            database_year = None
+            timeout = None
+            request_method = ""
+            final_path = ""
+            final_params.clear()
+            merged_headers.clear()
+            context_path = ""
+            body = b""
+            response = None
+            current_response = None
+            transport_error = None
+            self = None  # type: ignore[assignment]

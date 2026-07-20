@@ -14,3 +14,8 @@
   detaching unsafe exception causes, and sanitizing actual request values.
 - Preserve `ErrorContext.url` compatibility while exposing the same query-free
   value through the preferred `ErrorContext.path` alias.
+- Require identity content encoding and count raw response bytes so compressed
+  content cannot expand before the configured limit; reject encoded responses
+  without reading their bodies.
+- Remove request, response, client, and body objects from SDK error tracebacks,
+  and suppress provider details that echo generated path identifiers.

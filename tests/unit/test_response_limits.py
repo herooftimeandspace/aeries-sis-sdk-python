@@ -216,6 +216,35 @@ def test_provider_detail_omits_actual_query_and_header_secrets() -> None:
     assert raised.value.context.detail is None
 
 
+def test_provider_detail_omits_generated_path_identifiers() -> None:
+    """Provider text should not reintroduce identifiers removed by contract paths."""
+
+    student_id = "99400001"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Echo the generated operation's student identifier without URL syntax."""
+
+        return httpx.Response(
+            400,
+            request=request,
+            json={"Message": f"Student {student_id} was not found"},
+        )
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.students.get_student_picture(school_code=994, student_id=student_id)
+
+    rendered = f"{raised.value!s} {raised.value.context!r}"
+    assert student_id not in rendered
+    assert raised.value.context is not None
+    assert raised.value.context.path == (
+        "/api/v5/schools/{SchoolCode}/StudentPictures/{StudentID}"
+    )
+
+
 def test_transport_error_does_not_retain_original_exception_chain() -> None:
     """A wrapped transport failure should not retain its credential-bearing request."""
 
@@ -254,6 +283,41 @@ def test_malformed_json_error_does_not_retain_response_document() -> None:
 
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_sync_send_traceback_clears_request_and_response_locals() -> None:
+    """Sync SDK frames should not retain credentials, params, bodies, or the client."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a provider error after receiving credential-bearing request data."""
+
+        return httpx.Response(400, request=request, json={"Message": "Rejected"})
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="traceback-certificate",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.request(
+            "GET",
+            "/students",
+            params={"token": "traceback-query-secret"},
+            json={"RawBinary": "traceback-picture-data"},
+        )
+
+    traceback = raised.value.__traceback__
+    while traceback is not None and traceback.tb_frame.f_code.co_name != "_send":
+        traceback = traceback.tb_next
+    assert traceback is not None
+    locals_ = traceback.tb_frame.f_locals
+    assert locals_["self"] is None
+    assert locals_["params"] is None
+    assert locals_["json"] is None
+    assert locals_["headers"] is None
+    assert locals_["final_params"] == {}
+    assert locals_["merged_headers"] == {}
+    assert locals_["body"] == b""
+    assert locals_["response"] is None
 
 
 def test_retryable_response_is_closed_before_sync_backoff() -> None:
@@ -306,9 +370,11 @@ class RecordingSyncResponse:
 
         self.request = httpx.Request("GET", "https://district.example.edu/api/v5/students")
         self.status_code = 200
+        self.headers = httpx.Headers()
+        self.is_stream_consumed = False
         self.chunk_size: int | None = None
 
-    def iter_bytes(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
+    def iter_raw(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
         """Yield an oversized chunk after recording the caller's requested bound."""
 
         self.chunk_size = chunk_size
@@ -333,6 +399,49 @@ def test_sync_reader_requests_bounded_chunks_and_drops_live_chunk() -> None:
     assert traceback is not None
     assert traceback.tb_frame.f_locals["chunk"] == b""
     assert traceback.tb_frame.f_locals["body"] == bytearray()
+
+
+class NeverReadSyncStream(httpx.SyncByteStream):
+    """Response stream that fails if compressed bytes are ever consumed."""
+
+    def __init__(self) -> None:
+        """Track whether the client attempted to iterate compressed bytes."""
+
+        self.was_read = False
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        """Fail because encoded response bodies must be rejected before reading."""
+
+        self.was_read = True
+        raise AssertionError("compressed response body was read")
+
+
+def test_sync_client_forces_identity_and_rejects_encoded_body_before_read() -> None:
+    """The sync client should prevent HTTPX from expanding compressed responses."""
+
+    stream = NeverReadSyncStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return an encoded response even though the SDK requested identity."""
+
+        assert request.headers["Accept-Encoding"] == "identity"
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"Content-Encoding": "gzip"},
+            stream=stream,
+        )
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError):
+        client.system.get_aeries_installation_information(
+            headers={"Accept-Encoding": "gzip"}
+        )
+
+    assert not stream.was_read
 
 
 @pytest.mark.parametrize("invalid_limit", [0, -1, 1.5, True])
@@ -464,6 +573,43 @@ async def test_async_transport_error_does_not_retain_original_exception_chain() 
 
 
 @pytest.mark.asyncio
+async def test_async_send_traceback_clears_request_and_response_locals() -> None:
+    """Async SDK frames should clear request and response data before propagation."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a provider error after receiving sensitive async request data."""
+
+        return httpx.Response(400, request=request, json={"Message": "Rejected"})
+
+    async with AsyncClient(
+        base_url="https://district.example.edu/aeries",
+        certificate="traceback-certificate",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(AeriesValidationError) as raised:
+            await client.request(
+                "GET",
+                "/students",
+                params={"token": "traceback-query-secret"},
+                json={"RawBinary": "traceback-picture-data"},
+            )
+
+    traceback = raised.value.__traceback__
+    while traceback is not None and traceback.tb_frame.f_code.co_name != "_send":
+        traceback = traceback.tb_next
+    assert traceback is not None
+    locals_ = traceback.tb_frame.f_locals
+    assert locals_["self"] is None
+    assert locals_["params"] is None
+    assert locals_["json"] is None
+    assert locals_["headers"] is None
+    assert locals_["final_params"] == {}
+    assert locals_["merged_headers"] == {}
+    assert locals_["body"] == b""
+    assert locals_["response"] is None
+
+
+@pytest.mark.asyncio
 async def test_retryable_response_is_closed_before_async_backoff(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """The async client should release a retry response before sleeping."""
 
@@ -513,9 +659,11 @@ class RecordingAsyncResponse:
 
         self.request = httpx.Request("GET", "https://district.example.edu/api/v5/students")
         self.status_code = 200
+        self.headers = httpx.Headers()
+        self.is_stream_consumed = False
         self.chunk_size: int | None = None
 
-    async def aiter_bytes(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
+    async def aiter_raw(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
         """Yield an oversized async chunk after recording the requested bound."""
 
         self.chunk_size = chunk_size
@@ -544,3 +692,82 @@ async def test_async_reader_requests_bounded_chunks_and_drops_live_chunk() -> No
     assert traceback is not None
     assert traceback.tb_frame.f_locals["chunk"] == b""
     assert traceback.tb_frame.f_locals["body"] == bytearray()
+
+
+class NeverReadAsyncStream(httpx.AsyncByteStream):
+    """Async response stream that fails if compressed bytes are consumed."""
+
+    def __init__(self) -> None:
+        """Track whether async iteration was attempted."""
+
+        self.was_read = False
+
+    async def __aiter__(self):  # type: ignore[no-untyped-def]
+        """Fail because encoded responses must be rejected before async reading."""
+
+        self.was_read = True
+        raise AssertionError("compressed response body was read")
+        yield b""  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_async_client_forces_identity_and_rejects_encoded_body_before_read() -> None:
+    """The async client should prevent HTTPX from expanding compressed responses."""
+
+    stream = NeverReadAsyncStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return an encoded response even though the SDK requested identity."""
+
+        assert request.headers["Accept-Encoding"] == "identity"
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"Content-Encoding": "gzip"},
+            stream=stream,
+        )
+
+    async with AsyncClient(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(AeriesValidationError):
+            await client.system.get_aeries_installation_information()
+
+    assert not stream.was_read
+
+
+def assert_size_traceback_has_no_live_httpx_response(error: BaseException) -> None:
+    """Assert runtime size-error frames retain neither responses nor requests."""
+
+    traceback = error.__traceback__
+    runtime_frames = 0
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__") == "aeries_sis_sdk._runtime":
+            runtime_frames += 1
+            for value in traceback.tb_frame.f_locals.values():
+                assert not isinstance(value, (httpx.Request, httpx.Response))
+        traceback = traceback.tb_next
+    assert runtime_frames
+
+
+def test_size_error_traceback_has_no_live_httpx_response() -> None:
+    """Size errors should be built from scalars after dropping the response object."""
+
+    body = student_picture_body("cGhvdG8=" * 20)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return an oversized student-picture body."""
+
+        return httpx.Response(200, request=request, content=body)
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        max_response_bytes=len(body) - 1,
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesResponseTooLargeError) as raised:
+        client.students.get_student_picture(school_code=994, student_id=99400001)
+
+    assert_size_traceback_has_no_live_httpx_response(raised.value)
