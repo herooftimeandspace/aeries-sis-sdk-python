@@ -100,6 +100,73 @@ def sanitize_provider_detail(detail: str, *, secrets: tuple[str, ...] = ()) -> s
     return normalized[:MAX_ERROR_DETAIL_CHARACTERS]
 
 
+def path_parameter_values(safe_path: str, actual_path: str) -> tuple[str, ...]:
+    """Return actual segments that can align with contract placeholders.
+
+    Generated routes may omit optional placeholders, so their template and
+    request paths do not always have the same number of segments. This matcher
+    permits placeholders to be omitted, keeps literal segments aligned, and
+    conservatively returns the union of identifier values from every valid
+    alignment. Returning extra candidates only suppresses provider detail; it
+    never changes the request or its parsed response.
+    """
+
+    template_segments = safe_path.strip("/").split("/")
+    actual_segments = unquote(actual_path).strip("/").split("/")
+    memo: dict[tuple[int, int], tuple[bool, frozenset[str]]] = {}
+
+    def align(template_index: int, actual_index: int) -> tuple[bool, frozenset[str]]:
+        """Match one template suffix and collect all placeholder candidates."""
+
+        key = (template_index, actual_index)
+        if key in memo:
+            return memo[key]
+        if template_index == len(template_segments):
+            result: tuple[bool, frozenset[str]] = (
+                actual_index == len(actual_segments),
+                frozenset(),
+            )
+            memo[key] = result
+            return result
+
+        template_segment = template_segments[template_index]
+        is_placeholder = "{" in template_segment and "}" in template_segment
+        candidates: set[str] = set()
+        matched = False
+        if is_placeholder:
+            # One alignment omits this placeholder; another consumes the next
+            # actual segment. Only paths whose remaining literals align count.
+            omitted, omitted_values = align(template_index + 1, actual_index)
+            if omitted:
+                matched = True
+                candidates.update(omitted_values)
+            if actual_index < len(actual_segments):
+                consumed, consumed_values = align(template_index + 1, actual_index + 1)
+                if consumed:
+                    matched = True
+                    candidates.update(consumed_values)
+                    candidates.add(actual_segments[actual_index])
+        elif (
+            actual_index < len(actual_segments)
+            and template_segment.casefold() == actual_segments[actual_index].casefold()
+        ):
+            matched, literal_values = align(template_index + 1, actual_index + 1)
+            candidates.update(literal_values)
+
+        result = (matched, frozenset(candidates))
+        memo[key] = result
+        return result
+
+    values: set[str] = set()
+    # A tenant base URL can add path segments before `/api/v5`, so try each
+    # suffix and keep values only from complete template alignments.
+    for start_index in range(len(actual_segments)):
+        matched, candidates = align(0, start_index)
+        if matched:
+            values.update(candidates)
+    return tuple(values)
+
+
 def request_values_to_redact(
     request: httpx.Request,
     *,
@@ -117,17 +184,7 @@ def request_values_to_redact(
     values = [value for _, value in request.url.params.multi_items() if value]
     values.extend(value for value in request.headers.values() if value)
     if safe_path:
-        template_segments = safe_path.strip("/").split("/")
-        actual_segments = unquote(request.url.path).strip("/").split("/")
-        # Base URLs may add leading tenant segments. Align the documented path
-        # from the right before collecting values substituted for placeholders.
-        if len(actual_segments) >= len(template_segments):
-            actual_segments = actual_segments[-len(template_segments) :]
-            values.extend(
-                actual
-                for template, actual in zip(template_segments, actual_segments, strict=True)
-                if "{" in template and "}" in template and actual
-            )
+        values.extend(path_parameter_values(safe_path, request.url.path))
     return tuple(dict.fromkeys(values))
 
 
@@ -322,7 +379,33 @@ def validate_response(
         operation = None
         path = None
         raise error
-    return state.parse_operation_payload(operation, payload)
+    model_validation_failed = False
+    try:
+        parsed_payload = state.parse_operation_payload(operation, payload)
+    except ValueError:
+        # Pydantic validation errors may retain the complete input document.
+        # Leave that exception handler before raising a detached SDK error.
+        model_validation_failed = True
+        parsed_payload = None
+    if model_validation_failed:
+        context = ErrorContext(
+            method=response.request.method,
+            path=path or response.request.url.path,
+            status_code=response.status_code,
+            detail="Response JSON did not match the documented model.",
+        )
+        error = AeriesValidationError(
+            "Aeries API response did not match the documented model.",
+            context=context,
+        )
+        response = None  # type: ignore[assignment]
+        body = None
+        state = None  # type: ignore[assignment]
+        operation = None
+        path = None
+        payload = None
+        raise error
+    return parsed_payload
 
 
 def response_too_large_error(
@@ -400,26 +483,31 @@ def read_limited_response(
         # httpx materializing decoded data before the limit check.
         raw_iterator = response.iter_raw(chunk_size=chunk_size)
     response = None  # type: ignore[assignment]
-    while raw_iterator is not None:
-        try:
-            chunk = next(raw_iterator)
-        except StopIteration:
-            raw_iterator = None
-            break
-        remaining = max_response_bytes + 1 - len(body)
-        body.extend(chunk[:remaining])
-        if len(body) > max_response_bytes:
-            size_error = response_too_large_error(
-                method=method,
-                status_code=status_code,
-                path=path,
-                max_response_bytes=max_response_bytes,
-            )
-            body.clear()
-            chunk = b""
-            raw_iterator = None
-            raise size_error
-    return bytes(body)
+    chunk = b""
+    try:
+        while raw_iterator is not None:
+            try:
+                chunk = next(raw_iterator)
+            except StopIteration:
+                raw_iterator = None
+                break
+            remaining = max_response_bytes + 1 - len(body)
+            body.extend(chunk[:remaining])
+            if len(body) > max_response_bytes:
+                raise response_too_large_error(
+                    method=method,
+                    status_code=status_code,
+                    path=path,
+                    max_response_bytes=max_response_bytes,
+                )
+        return bytes(body)
+    finally:
+        # Traceback collectors preserve frame locals for every failure type,
+        # including exceptions raised by injected custom response streams.
+        body.clear()
+        chunk = b""
+        raw_iterator = None
+        response = None  # type: ignore[assignment]
 
 
 async def read_limited_response_async(
@@ -458,27 +546,31 @@ async def read_limited_response_async(
         # Mirror the sync path by counting raw identity bytes before parsing.
         raw_iterator = response.aiter_raw(chunk_size=chunk_size)
     response = None  # type: ignore[assignment]
-    while raw_iterator is not None:
-        try:
-            chunk = await anext(raw_iterator)
-        except StopAsyncIteration:
-            raw_iterator = None
-            break
-        remaining = max_response_bytes + 1 - len(body)
-        body.extend(chunk[:remaining])
-        if len(body) > max_response_bytes:
-            size_error = response_too_large_error(
-                method=method,
-                status_code=status_code,
-                path=path,
-                max_response_bytes=max_response_bytes,
-            )
-            body.clear()
-            chunk = b""
-            loaded_content = b""
-            raw_iterator = None
-            raise size_error
-    return bytes(body)
+    chunk = b""
+    try:
+        while raw_iterator is not None:
+            try:
+                chunk = await anext(raw_iterator)
+            except StopAsyncIteration:
+                raw_iterator = None
+                break
+            remaining = max_response_bytes + 1 - len(body)
+            body.extend(chunk[:remaining])
+            if len(body) > max_response_bytes:
+                raise response_too_large_error(
+                    method=method,
+                    status_code=status_code,
+                    path=path,
+                    max_response_bytes=max_response_bytes,
+                )
+        return bytes(body)
+    finally:
+        # Keep async traceback retention identical to the synchronous reader.
+        body.clear()
+        chunk = b""
+        loaded_content = b""
+        raw_iterator = None
+        response = None  # type: ignore[assignment]
 
 
 def wrap_transport_error(method: str, path: str, error: Exception) -> AeriesTransportError:

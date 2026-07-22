@@ -245,6 +245,36 @@ def test_provider_detail_omits_generated_path_identifiers() -> None:
     )
 
 
+def test_provider_detail_omits_identifiers_before_an_optional_path_segment() -> None:
+    """An omitted optional suffix must not shift a required identifier out of redaction."""
+
+    school_code = "994"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Echo the school code from a route whose optional student id was omitted."""
+
+        return httpx.Response(
+            400,
+            request=request,
+            json={"Message": f"School {school_code} was not found"},
+        )
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.students.get_contacts(school_code=school_code)
+
+    rendered = f"{raised.value!s} {raised.value.context!r}"
+    assert school_code not in rendered
+    assert raised.value.context is not None
+    assert raised.value.context.path == (
+        "/api/v5/schools/{SchoolCode}/contacts/{StudentID}"
+    )
+    assert raised.value.context.detail is None
+
+
 def test_transport_error_does_not_retain_original_exception_chain() -> None:
     """A wrapped transport failure should not retain its credential-bearing request."""
 
@@ -283,6 +313,37 @@ def test_malformed_json_error_does_not_retain_response_document() -> None:
 
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_model_validation_error_does_not_retain_response_document() -> None:
+    """Generated-model failures should expose a safe SDK error with scrubbed locals."""
+
+    sensitive_body = b'[{"CellPhone":{"RawBinary":"sensitive-picture-data"}}]'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return valid JSON whose documented scalar field has an invalid object value."""
+
+        return httpx.Response(200, request=request, content=sensitive_body)
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.students.get_contacts(school_code=994)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    traceback = raised.value.__traceback__
+    while traceback is not None and traceback.tb_frame.f_code.co_name != "validate_response":
+        traceback = traceback.tb_next
+    assert traceback is not None
+    locals_ = traceback.tb_frame.f_locals
+    assert locals_["response"] is None
+    assert locals_["body"] is None
+    assert locals_["payload"] is None
+    assert locals_["state"] is None
+    assert locals_["operation"] is None
 
 
 def test_sync_send_traceback_clears_request_and_response_locals() -> None:
@@ -399,6 +460,36 @@ def test_sync_reader_requests_bounded_chunks_and_drops_live_chunk() -> None:
     assert traceback is not None
     assert traceback.tb_frame.f_locals["chunk"] == b""
     assert traceback.tb_frame.f_locals["body"] == bytearray()
+
+
+class FailingSyncResponse(RecordingSyncResponse):
+    """Response double that fails after yielding sensitive partial bytes."""
+
+    def iter_raw(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
+        """Yield one chunk and then simulate a custom transport stream failure."""
+
+        self.chunk_size = chunk_size
+        yield b"sensitive-picture-data"
+        raise RuntimeError("custom stream failed")
+
+
+def test_sync_reader_scrubs_partial_body_after_custom_stream_failure() -> None:
+    """Unexpected sync stream errors must not retain already-read response bytes."""
+
+    with pytest.raises(RuntimeError) as raised:
+        read_limited_response(  # type: ignore[arg-type]
+            FailingSyncResponse(),
+            path="/students",
+            max_response_bytes=100,
+        )
+
+    traceback = raised.value.__traceback__
+    while traceback is not None and traceback.tb_frame.f_code.co_name != "read_limited_response":
+        traceback = traceback.tb_next
+    assert traceback is not None
+    assert traceback.tb_frame.f_locals["chunk"] == b""
+    assert traceback.tb_frame.f_locals["body"] == bytearray()
+    assert traceback.tb_frame.f_locals["raw_iterator"] is None
 
 
 class NeverReadSyncStream(httpx.SyncByteStream):
@@ -692,6 +783,40 @@ async def test_async_reader_requests_bounded_chunks_and_drops_live_chunk() -> No
     assert traceback is not None
     assert traceback.tb_frame.f_locals["chunk"] == b""
     assert traceback.tb_frame.f_locals["body"] == bytearray()
+
+
+class FailingAsyncResponse(RecordingAsyncResponse):
+    """Async response double that fails after yielding sensitive partial bytes."""
+
+    async def aiter_raw(self, chunk_size: int | None = None):  # type: ignore[no-untyped-def]
+        """Yield one chunk and then simulate an async custom stream failure."""
+
+        self.chunk_size = chunk_size
+        yield b"sensitive-picture-data"
+        raise RuntimeError("custom async stream failed")
+
+
+@pytest.mark.asyncio
+async def test_async_reader_scrubs_partial_body_after_custom_stream_failure() -> None:
+    """Unexpected async stream errors must not retain already-read response bytes."""
+
+    with pytest.raises(RuntimeError) as raised:
+        await read_limited_response_async(  # type: ignore[arg-type]
+            FailingAsyncResponse(),
+            path="/students",
+            max_response_bytes=100,
+        )
+
+    traceback = raised.value.__traceback__
+    while (
+        traceback is not None
+        and traceback.tb_frame.f_code.co_name != "read_limited_response_async"
+    ):
+        traceback = traceback.tb_next
+    assert traceback is not None
+    assert traceback.tb_frame.f_locals["chunk"] == b""
+    assert traceback.tb_frame.f_locals["body"] == bytearray()
+    assert traceback.tb_frame.f_locals["raw_iterator"] is None
 
 
 class NeverReadAsyncStream(httpx.AsyncByteStream):

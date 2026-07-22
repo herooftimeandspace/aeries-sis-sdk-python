@@ -27,6 +27,9 @@ The runtime reads raw identity chunks so httpx cannot expand compressed data
 before the limit check. It clears the temporary buffer, live chunk, iterator,
 and response reference before creating the size exception. The
 exception stores only the method, status, contract path, and configured limit.
+The same cleanup runs when an injected sync or async response stream raises an
+unexpected exception after yielding partial data, so traceback-local capture
+does not preserve the partial body.
 
 Normal HTTP and JSON errors follow the same safe-context policy. Generated
 operations record their contract path template rather than a URL containing
@@ -37,9 +40,11 @@ Provider `Message` text is collapsed to one line and limited to 512 characters.
 Messages containing actual request query/header values, identifiers substituted
 into generated contract paths, known credentials, URLs, query strings, or long
 encoded values are discarded in favor of generic status text. Sanitized
-transport and malformed-JSON errors are raised without the original exception
-chain because httpx requests and JSON parser errors can retain complete
-credentials or response documents. Before an SDK error propagates, transport
-and validation frames also clear client, request, response, header, parameter,
-request-body, and response-body references that traceback-local collectors
-might otherwise preserve.
+path matching permits omitted optional placeholders, which keeps earlier school
+or student identifiers aligned with their contract placeholders. Transport,
+malformed-JSON, and generated-model validation errors are raised without the
+original exception chain because transport, parser, and model errors can retain
+complete credentials or response documents. Before an SDK error propagates,
+transport and validation frames also clear client, request, response, header,
+parameter, request-body, parsed-payload, and response-body references that
+traceback-local collectors might otherwise preserve.

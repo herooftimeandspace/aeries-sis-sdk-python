@@ -19,3 +19,6 @@
   without reading their bodies.
 - Remove request, response, client, and body objects from SDK error tracebacks,
   and suppress provider details that echo generated path identifiers.
+- Align identifiers across omitted optional path placeholders, detach generated
+  model-validation failures from their input documents, and scrub partial sync
+  and async bodies when custom response streams fail.

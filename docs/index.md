@@ -53,6 +53,11 @@ query-free contract path and bounded, sanitized provider detail, so callers can
 log normal SDK errors without exposing the API certificate, query parameters,
 raw picture bytes, or a complete provider response body.
 
+If valid JSON does not match a generated response model, the SDK raises
+`AeriesValidationError` with safe request metadata instead of exposing the
+underlying model validator and its input document. Partial bodies are also
+cleared when an injected transport fails partway through a response stream.
+
 The SDK forces `Accept-Encoding: identity` and rejects a compressed response
 before reading its body. This makes `max_response_bytes` an allocation boundary
 the SDK can enforce before HTTP content decoding; caller-provided
