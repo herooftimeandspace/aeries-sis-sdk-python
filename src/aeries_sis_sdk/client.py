@@ -7,7 +7,14 @@ from typing import Any
 
 import httpx
 
-from ._runtime import RuntimeState, validate_response, wrap_transport_error
+from ._runtime import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    RuntimeState,
+    read_limited_response,
+    safe_request_path,
+    validate_response,
+    wrap_transport_error,
+)
 from .generated import NAMESPACE_REGISTRY
 
 
@@ -27,10 +34,16 @@ class Client:
         default_database_year: str | int | None = None,
         timeout: float = 30.0,
         user_agent: str = "aeries-sis-sdk-python/0.1.0",
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         transport: httpx.BaseTransport | None = None,
         session: httpx.Client | None = None,
     ) -> None:
-        """Create a sync client and attach all generated namespaces."""
+        """Create a sync client and attach all generated namespaces.
+
+        ``max_response_bytes`` must be a positive integer. It limits decoded
+        response bytes for every status code and prevents large student-picture
+        or provider-error payloads from being buffered without an SDK-owned cap.
+        """
 
         self._state = RuntimeState(
             base_url=base_url,
@@ -38,6 +51,7 @@ class Client:
             default_database_year=default_database_year,
             timeout=timeout,
             user_agent=user_agent,
+            max_response_bytes=max_response_bytes,
         )
         self._owns_session = session is None
         self._session = session or httpx.Client(
@@ -142,35 +156,98 @@ class Client:
     ) -> Any:
         """Send a request with retry behavior driven by the contract metadata."""
 
-        request_method, final_path, final_params = self._state.request_parts(
-            method=method,
-            path=path,
-            path_params=path_params,
-            params=params,
-            database_year=database_year,
-            operation=operation,
-        )
-        merged_headers = self._state.headers(headers)
-        max_attempts = 3 if self._state.should_retry(operation) else 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = self._session.request(
-                    request_method,
-                    final_path,
-                    params=final_params,
-                    json=json,
-                    headers=merged_headers,
-                    timeout=timeout or self._state.timeout,
-                )
-            except httpx.HTTPError as exc:
-                if attempt < max_attempts and self._state.should_retry(operation):
+        request_method = ""
+        final_path = ""
+        final_params: dict[str, Any] = {}
+        merged_headers: dict[str, str] = {}
+        context_path = ""
+        body = b""
+        response: httpx.Response | None = None
+        current_response: httpx.Response | None = None
+        transport_error = None
+        try:
+            request_method, final_path, final_params = self._state.request_parts(
+                method=method,
+                path=path,
+                path_params=path_params,
+                params=params,
+                database_year=database_year,
+                operation=operation,
+            )
+            merged_headers = self._state.headers(headers)
+            context_path = safe_request_path(operation, final_path)
+            max_attempts = 3 if self._state.should_retry(operation) else 1
+            for attempt in range(1, max_attempts + 1):
+                retry_transport = False
+                transport_error = None
+                try:
+                    with self._session.stream(
+                        request_method,
+                        final_path,
+                        params=final_params,
+                        json=json,
+                        headers=merged_headers,
+                        timeout=timeout or self._state.timeout,
+                    ) as current_response:
+                        response = current_response
+                        # Read every status through the bound before deciding to
+                        # retry, then leave the context so backoff holds no socket.
+                        body = read_limited_response(
+                            current_response,
+                            path=context_path,
+                            max_response_bytes=self._state.max_response_bytes,
+                        )
+                except httpx.HTTPError as exc:
+                    if attempt < max_attempts and self._state.should_retry(operation):
+                        retry_transport = True
+                    else:
+                        transport_error = wrap_transport_error(
+                            request_method,
+                            context_path,
+                            exc,
+                        )
+                if transport_error is not None:
+                    # Raise outside the active httpx handler; the outer finally
+                    # clears every request-bearing local before propagation.
+                    raise transport_error
+                if retry_transport:
                     self._state.sleep(attempt)
                     continue
-                raise wrap_transport_error(request_method, final_path, exc) from exc
-            if response.status_code < 400:
-                return validate_response(state=self._state, operation=operation, response=response)
-            if attempt < max_attempts and self._state.should_retry(operation, response.status_code):
-                self._state.sleep(attempt)
-                continue
-            return validate_response(state=self._state, operation=operation, response=response)
-        raise RuntimeError("Unreachable retry loop exit in sync client.")
+                if response is None:
+                    raise RuntimeError("A response was not available after a successful send.")
+                if attempt < max_attempts and self._state.should_retry(
+                    operation, response.status_code
+                ):
+                    self._state.sleep(attempt)
+                    continue
+                return validate_response(
+                    state=self._state,
+                    operation=operation,
+                    response=response,
+                    body=body,
+                    path=context_path,
+                )
+            raise RuntimeError("Unreachable retry loop exit in sync client.")
+        finally:
+            # Traceback collectors can retain frame locals. Drop all caller,
+            # request, response, body, session, and credential references before
+            # any exception leaves this SDK transport frame.
+            method = ""
+            path = ""
+            operation = None
+            path_params = None
+            params = None
+            json = None
+            headers = None
+            database_year = None
+            timeout = None
+            request_method = ""
+            final_path = ""
+            final_params.clear()
+            merged_headers.clear()
+            context_path = ""
+            body = b""
+            response = None
+            current_response = None
+            transport_error = None
+            self = None  # type: ignore[assignment]

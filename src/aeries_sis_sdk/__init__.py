@@ -8,6 +8,7 @@ from .errors import (
     AeriesError,
     AeriesHTTPError,
     AeriesNotFoundError,
+    AeriesResponseTooLargeError,
     AeriesTransportError,
     AeriesValidationError,
 )
@@ -17,10 +18,10 @@ __all__ = [
     "AeriesError",
     "AeriesHTTPError",
     "AeriesNotFoundError",
+    "AeriesResponseTooLargeError",
     "AeriesTransportError",
     "AeriesValidationError",
     "AsyncClient",
     "Client",
     "load_contract",
 ]
-
