@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix two failing GitHub Actions workflows: the live workflow gated its job on
+  the `secrets` context, which is unavailable in a job-level `if` and made the
+  file invalid, and the pages workflow deployed on a `v*` tag, which the
+  `github-pages` environment rejects and which cancelled main's own deploy
+  through the shared concurrency group.
+
 ## 0.2.0 - 2026-09-28
 
 - Initial project scaffolding for the Aeries SIS Python SDK.
