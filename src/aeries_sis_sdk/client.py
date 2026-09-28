@@ -33,7 +33,7 @@ class Client:
         certificate: str,
         default_database_year: str | int | None = None,
         timeout: float = 30.0,
-        user_agent: str = "aeries-sis-sdk-python/0.1.0",
+        user_agent: str = "aeries-sis-sdk-python/0.2.0",
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         transport: httpx.BaseTransport | None = None,
         session: httpx.Client | None = None,

@@ -2,7 +2,10 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-28
+
 - Initial project scaffolding for the Aeries SIS Python SDK.
+- Bump the default user agent to `aeries-sis-sdk-python/0.2.0`.
 - Add equivalent sync and async streaming response limits, with a 32 MiB default
   and a typed `AeriesResponseTooLargeError` for oversized bodies.
 - Sanitize exception context so it contains query-free contract paths and only
