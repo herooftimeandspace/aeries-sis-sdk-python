@@ -26,7 +26,7 @@ from aeries_sis_sdk import Client
 client = Client(
     base_url="https://district.example.edu/aeries",
     certificate="replace-me",
-    max_response_bytes=16 * 1024 * 1024,
+    max_response_bytes=32 * 1024 * 1024,
 )
 
 schools = client.schools.list_schools()
@@ -41,9 +41,10 @@ print(schools)
 - `timeout`: Request timeout in seconds. Default is `30.0`.
 - `user_agent`: Optional user agent override.
 - `max_response_bytes`: Positive integer limit for each raw identity response body. The
-  default is 16 MiB (`16777216` bytes). A response exactly at the limit is
-  accepted; a larger success or error response raises
-  `AeriesResponseTooLargeError` before JSON parsing. This client-level bound is
+  default is 32 MiB (`33554432` bytes) and the accepted ceiling is 1 TiB. A response
+  exactly at the limit is accepted; a larger success or error response raises
+  `AeriesResponseTooLargeError` before JSON parsing. That exception also carries
+  `limit` and `retryable` as structured attributes. This client-level bound is
   especially important for student-picture responses containing base64 data.
 
 Both clients read response bodies incrementally. Exceptions include only a
@@ -51,10 +52,17 @@ query-free contract path and bounded, sanitized provider detail, so callers can
 log normal SDK errors without exposing the API certificate, query parameters,
 raw picture bytes, or a complete provider response body.
 
-If valid JSON does not match a generated response model, the SDK raises
-`AeriesValidationError` with safe request metadata instead of exposing the
-underlying model validator and its input document. Partial bodies are also
-cleared when an injected transport fails partway through a response stream.
+If a success body is not valid JSON, or valid JSON does not match a generated
+response model, the SDK raises `AeriesResponseDecodeError` (a subclass of
+`AeriesValidationError`) with safe request metadata, including the status the
+transport already observed, instead of exposing the underlying model validator
+and its input document. A success response whose body is empty or whitespace is
+reported as an empty result rather than a decode failure. Partial bodies are
+also cleared when an injected transport fails partway through a response stream.
+
+Requests that carry a JSON body never retain provider detail in their errors,
+because a provider message can echo submitted student or staff data that cannot
+be identified exhaustively by field name. Those errors keep status-derived text.
 
 The SDK forces `Accept-Encoding: identity` and rejects a compressed response
 before reading its body. This makes `max_response_bytes` an allocation boundary
@@ -74,6 +82,10 @@ Environment variables used by docs, tests, and live checks:
 2. Sync the upstream docs into committed contract artifacts with `make sync-contracts`.
 3. Regenerate endpoint wrappers with `make generate-sdk`.
 4. Run `make check` before committing.
+5. Run `make audit` before publishing a release. It runs `pip check` and
+   `pip-audit` over the installed dependency set, and is the security gate the
+   release process requires. It needs network access to reach the advisory
+   database, so it is kept out of `make check`.
 
 ## Documentation
 

@@ -24,6 +24,7 @@ from .errors import (
     AeriesAuthError,
     AeriesHTTPError,
     AeriesNotFoundError,
+    AeriesResponseDecodeError,
     AeriesResponseTooLargeError,
     AeriesTransportError,
     AeriesValidationError,
@@ -33,7 +34,8 @@ from .generated.models import MODEL_REGISTRY
 from .models import parse_payload
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_RESPONSE_BYTES_LIMIT = 1 << 40
 MAX_ERROR_DETAIL_CHARACTERS = 512
 MAX_RESPONSE_CHUNK_BYTES = 64 * 1024
 LONG_ENCODED_VALUE_PATTERN = re.compile(r"[A-Za-z0-9+/=_-]{128,}")
@@ -55,12 +57,16 @@ def validate_max_response_bytes(value: int) -> int:
 
     A boolean is rejected explicitly because Python treats booleans as integers,
     while a value such as ``True`` is not a meaningful byte budget for callers.
+    Values above 1 TiB are rejected too, because a limit that large cannot
+    protect the process that has to hold the body.
     """
 
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("max_response_bytes must be a positive integer.")
     if value <= 0:
         raise ValueError("max_response_bytes must be a positive integer.")
+    if value > MAX_RESPONSE_BYTES_LIMIT:
+        raise ValueError("max_response_bytes cannot exceed 1 TiB.")
     return value
 
 
@@ -194,15 +200,22 @@ def parse_error_response(
     body: bytes | None = None,
     path: str | None = None,
     certificate: str = "",
+    retain_provider_detail: bool = True,
 ) -> Exception:
-    """Turn a bounded HTTP response into the most specific safe SDK exception."""
+    """Turn a bounded HTTP response into the most specific safe SDK exception.
+
+    ``retain_provider_detail`` is false for requests that carried a body.
+    Those bodies can hold student or staff data that cannot be identified
+    exhaustively by field name, so dropping provider detail for them is safer
+    than keeping what may be an echo of the submitted payload.
+    """
 
     detail: str | None = None
     try:
         payload = json.loads(response.content if body is None else body)
     except (UnicodeDecodeError, ValueError):
         payload = None
-    if isinstance(payload, dict):
+    if retain_provider_detail and isinstance(payload, dict):
         detail_value = payload.get("Message")
         if isinstance(detail_value, str):
             request_secrets = request_values_to_redact(response.request, safe_path=path)
@@ -338,6 +351,7 @@ def validate_response(
     response: httpx.Response,
     body: bytes | None = None,
     path: str | None = None,
+    retain_provider_detail: bool = True,
 ) -> Any:
     """Validate a bounded response and return parsed JSON or raise an SDK exception."""
 
@@ -347,6 +361,7 @@ def validate_response(
             body=body,
             path=path,
             certificate=state.certificate,
+            retain_provider_detail=retain_provider_detail,
         )
         # Drop request, response, and body objects before this frame enters the
         # traceback retained by the sanitized SDK exception.
@@ -358,9 +373,14 @@ def validate_response(
         raise error
     if response.status_code == 204:
         return None
+    raw_body = response.content if body is None else body
+    # A success response with no meaningful body carries no value to parse, so
+    # it is reported as an empty result instead of a decode failure.
+    if not raw_body.strip():
+        return None
     invalid_json = False
     try:
-        payload = json.loads(response.content if body is None else body)
+        payload = json.loads(raw_body)
     except (UnicodeDecodeError, ValueError):
         invalid_json = True
     if invalid_json:
@@ -372,9 +392,10 @@ def validate_response(
         )
         # Raise after leaving the parser exception handler so JSONDecodeError
         # cannot retain its full response document through exception chaining.
-        error = AeriesValidationError("Aeries API returned invalid JSON.", context=context)
+        error = AeriesResponseDecodeError("Aeries API returned invalid JSON.", context=context)
         response = None  # type: ignore[assignment]
         body = None
+        raw_body = b""
         state = None  # type: ignore[assignment]
         operation = None
         path = None
@@ -388,13 +409,14 @@ def validate_response(
         model_validation_failed = True
         parsed_payload = None
     if model_validation_failed:
+        raw_body = b""
         context = ErrorContext(
             method=response.request.method,
             path=path or response.request.url.path,
             status_code=response.status_code,
             detail="Response JSON did not match the documented model.",
         )
-        error = AeriesValidationError(
+        error = AeriesResponseDecodeError(
             "Aeries API response did not match the documented model.",
             context=context,
         )
@@ -426,6 +448,8 @@ def response_too_large_error(
     return AeriesResponseTooLargeError(
         f"Aeries API response exceeded the {max_response_bytes}-byte limit.",
         context=context,
+        limit=max_response_bytes,
+        retryable=False,
     )
 
 

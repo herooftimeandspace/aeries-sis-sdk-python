@@ -80,7 +80,36 @@ class AeriesValidationError(AeriesError):
 
 
 class AeriesResponseTooLargeError(AeriesError):
-    """Raised when a response crosses the client's configured byte limit."""
+    """Raised when a response crosses the client's configured byte limit.
+
+    ``limit`` repeats the configured bound and ``retryable`` states the retry
+    classification as structured data, so callers do not have to parse the
+    message to record either one. No response bytes are retained.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context: ErrorContext | None = None,
+        limit: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        """Store the safe scalar size metadata alongside the shared context."""
+
+        super().__init__(message, context=context)
+        self.limit = limit
+        self.retryable = retryable
+
+
+class AeriesResponseDecodeError(AeriesValidationError):
+    """Raised when a success response body is not usable JSON.
+
+    The transport already observed the HTTP status when decoding failed, so the
+    status stays on ``context`` rather than being dropped. This subclasses
+    :class:`AeriesValidationError` so existing handlers keep working. Like the
+    other transport errors it retains no response bytes.
+    """
 
 
 class AeriesHTTPError(AeriesError):
