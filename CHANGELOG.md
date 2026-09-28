@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Initial project scaffolding for the Aeries SIS Python SDK.
-- Add equivalent sync and async streaming response limits, with a 16 MiB default
+- Add equivalent sync and async streaming response limits, with a 32 MiB default
   and a typed `AeriesResponseTooLargeError` for oversized bodies.
 - Sanitize exception context so it contains query-free contract paths and only
   bounded provider messages that are safe to retain.
@@ -22,3 +22,8 @@
 - Align identifiers across omitted optional path placeholders, detach generated
   model-validation failures from their input documents, and scrub partial sync
   and async bodies when custom response streams fail.
+- Match the Go SDK's response hardening: a 32 MiB default limit with a 1 TiB
+  ceiling, structured `limit` and `retryable` attributes on
+  `AeriesResponseTooLargeError`, a typed `AeriesResponseDecodeError` that keeps
+  the observed status, blank success bodies reported as empty results, and no
+  provider detail retained for requests that carried a JSON body.

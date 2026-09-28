@@ -161,6 +161,7 @@ class Client:
         final_params: dict[str, Any] = {}
         merged_headers: dict[str, str] = {}
         context_path = ""
+        has_request_body = False
         body = b""
         response: httpx.Response | None = None
         current_response: httpx.Response | None = None
@@ -175,6 +176,9 @@ class Client:
                 operation=operation,
             )
             merged_headers = self._state.headers(headers)
+            # A request body can contain student or staff data that a provider
+            # may echo back, so its errors keep only status-derived text.
+            has_request_body = json is not None
             context_path = safe_request_path(operation, final_path)
             max_attempts = 3 if self._state.should_retry(operation) else 1
             for attempt in range(1, max_attempts + 1):
@@ -226,6 +230,7 @@ class Client:
                     response=response,
                     body=body,
                     path=context_path,
+                    retain_provider_detail=not has_request_body,
                 )
             raise RuntimeError("Unreachable retry loop exit in sync client.")
         finally:
@@ -246,6 +251,7 @@ class Client:
             final_params.clear()
             merged_headers.clear()
             context_path = ""
+            has_request_body = False
             body = b""
             response = None
             current_response = None

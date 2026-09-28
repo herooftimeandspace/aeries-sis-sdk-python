@@ -16,8 +16,8 @@ body is read. They count raw identity bytes while reading and stop after the
 configured `max_response_bytes` value plus one byte. Reading that one additional byte makes
 the boundary precise: a body exactly at the limit remains valid, while a larger
 body raises `AeriesResponseTooLargeError` before the runtime attempts JSON
-decoding. The default limit is 16 MiB, and callers may set another positive
-integer when constructing either client.
+decoding. The default limit is 32 MiB, and callers may set another positive
+integer up to 1 TiB when constructing either client.
 
 The limit applies to successful and unsuccessful responses. A response already
 known to be oversized is not retried, even for an otherwise retry-safe generated

@@ -8,8 +8,15 @@ import httpx
 import pytest
 
 from aeries_sis_sdk import AsyncClient, Client
-from aeries_sis_sdk._runtime import read_limited_response, read_limited_response_async
+from aeries_sis_sdk._runtime import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    MAX_RESPONSE_BYTES_LIMIT,
+    read_limited_response,
+    read_limited_response_async,
+    validate_max_response_bytes,
+)
 from aeries_sis_sdk.errors import (
+    AeriesResponseDecodeError,
     AeriesResponseTooLargeError,
     AeriesTransportError,
     AeriesValidationError,
@@ -896,3 +903,145 @@ def test_size_error_traceback_has_no_live_httpx_response() -> None:
         client.students.get_student_picture(school_code=994, student_id=99400001)
 
     assert_size_traceback_has_no_live_httpx_response(raised.value)
+
+
+def test_limit_validation_rejects_a_ceiling_above_one_tebibyte() -> None:
+    """A limit larger than 1 TiB cannot protect the process, so it is rejected."""
+
+    assert validate_max_response_bytes(MAX_RESPONSE_BYTES_LIMIT) == MAX_RESPONSE_BYTES_LIMIT
+    with pytest.raises(ValueError, match="cannot exceed 1 TiB"):
+        validate_max_response_bytes(MAX_RESPONSE_BYTES_LIMIT + 1)
+
+
+def test_default_limit_matches_the_documented_thirty_two_mebibytes() -> None:
+    """The conservative default stays aligned with the Go SDK's documented value."""
+
+    assert DEFAULT_MAX_RESPONSE_BYTES == 32 * 1024 * 1024
+
+
+def test_size_error_exposes_structured_limit_and_retry_classification() -> None:
+    """Callers should read the limit and retry decision without parsing the message."""
+
+    body = student_picture_body("cGhvdG8=" * 20)
+    limit = len(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return an oversized picture payload."""
+
+        return httpx.Response(200, request=request, content=body)
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        max_response_bytes=limit,
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesResponseTooLargeError) as raised:
+        client.students.get_student_picture(school_code=994, student_id=99400001)
+
+    assert raised.value.limit == limit
+    assert raised.value.retryable is False
+
+
+def test_provider_detail_is_dropped_for_requests_that_carried_a_body() -> None:
+    """A provider may echo a submitted payload, so bodied requests keep only status text."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Reject the submitted body while echoing part of it back."""
+
+        return httpx.Response(
+            400,
+            request=request,
+            json={"Message": "Rejected value Ramirez for student 99400001"},
+        )
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.request("POST", "/unmapped/path", json={"LastName": "Ramirez"})
+
+    assert "Ramirez" not in str(raised.value)
+    assert "99400001" not in str(raised.value)
+    assert str(raised.value) == "Aeries API returned HTTP 400"
+    assert raised.value.context is not None
+    assert raised.value.context.detail is None
+
+
+def test_provider_detail_is_kept_for_requests_without_a_body() -> None:
+    """A bodyless request cannot echo submitted data, so safe detail stays available."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a documented provider message."""
+
+        return httpx.Response(400, request=request, json={"Message": "DatabaseYear is invalid"})
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesValidationError) as raised:
+        client.system.get_aeries_installation_information()
+
+    assert str(raised.value) == "DatabaseYear is invalid"
+
+
+def test_blank_success_body_is_reported_as_an_empty_result() -> None:
+    """A success response with nothing to parse is empty, not a decode failure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a 200 whose body holds only whitespace."""
+
+        return httpx.Response(200, request=request, content=b"   \n")
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.request("GET", "/unmapped/path") is None
+
+
+def test_malformed_success_body_keeps_the_observed_status() -> None:
+    """A decode failure keeps the status the transport already saw."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a 206 carrying a truncated JSON document."""
+
+        return httpx.Response(206, request=request, content=b'{"StudentID": "994000')
+
+    with Client(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client, pytest.raises(AeriesResponseDecodeError) as raised:
+        client.students.get_student_picture(school_code=994, student_id=99400001)
+
+    assert isinstance(raised.value, AeriesValidationError)
+    assert raised.value.context is not None
+    assert raised.value.context.status_code == 206
+    assert "994000" not in repr(raised.value)
+
+
+@pytest.mark.anyio
+async def test_async_blank_body_and_decode_failure_match_the_sync_client() -> None:
+    """The async client should mirror the blank-body and decode-status behavior."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a blank body first, then a malformed one."""
+
+        if request.url.path.endswith("/blank"):
+            return httpx.Response(200, request=request, content=b"")
+        return httpx.Response(206, request=request, content=b"{")
+
+    async with AsyncClient(
+        base_url="https://district.example.edu/aeries",
+        certificate="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert await client.request("GET", "/blank") is None
+        with pytest.raises(AeriesResponseDecodeError) as raised:
+            await client.request("GET", "/malformed")
+
+    assert raised.value.context is not None
+    assert raised.value.context.status_code == 206
