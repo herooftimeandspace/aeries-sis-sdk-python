@@ -22,6 +22,8 @@
 - Align identifiers across omitted optional path placeholders, detach generated
   model-validation failures from their input documents, and scrub partial sync
   and async bodies when custom response streams fail.
+- Require `pip>=26.2.0` in the dev extra so the release audit gate does not
+  resolve a pip release affected by PYSEC-2026-3721.
 - Match the Go SDK's response hardening: a 32 MiB default limit with a 1 TiB
   ceiling, structured `limit` and `retryable` attributes on
   `AeriesResponseTooLargeError`, a typed `AeriesResponseDecodeError` that keeps
