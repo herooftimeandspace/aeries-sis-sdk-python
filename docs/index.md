@@ -84,6 +84,10 @@ Environment variables used by docs, tests, and live checks:
 2. Sync the upstream docs into committed contract artifacts with `make sync-contracts`.
 3. Regenerate endpoint wrappers with `make generate-sdk`.
 4. Run `make check` before committing.
+5. Run `make audit` before publishing a release. It runs `pip check` and
+   `pip-audit` over the installed dependency set, and is the security gate the
+   release process requires. It needs network access to reach the advisory
+   database, so it is kept out of `make check`.
 
 ## Documentation
 

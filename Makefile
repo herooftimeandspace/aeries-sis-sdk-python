@@ -1,7 +1,7 @@
 PYTHON ?= ./.venv/bin/python
 PIP ?= $(PYTHON) -m pip
 
-.PHONY: install sync-contracts generate-sdk test lint typecheck docs check build live-test
+.PHONY: install sync-contracts generate-sdk test lint typecheck docs check audit build live-test
 
 install:
 	$(PIP) install -e '.[dev]'
@@ -26,6 +26,10 @@ docs:
 	$(PYTHON) -m mkdocs build --strict
 
 check: lint typecheck test docs
+
+audit:
+	$(PYTHON) -m pip check
+	$(PYTHON) -m pip_audit
 
 build:
 	$(PYTHON) -m build --no-isolation
